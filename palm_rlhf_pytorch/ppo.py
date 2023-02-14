@@ -7,7 +7,7 @@ from collections import deque, namedtuple
 from random import randrange
 
 from beartype import beartype
-from beartype.typing import List, Optional, Callable, Deque, Union
+from beartype.typing import List, Optional, Callable, Deque
 
 import torch
 from torch import nn
@@ -21,7 +21,6 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from palm_rlhf_pytorch.palm import PaLM
-from palm_rlhf_pytorch.palm_enc_dec import PaLMEncDec
 from palm_rlhf_pytorch.reward import RewardModel
 from palm_rlhf_pytorch.optimizer import get_optimizer
 from palm_rlhf_pytorch.utils import masked_mean, eval_decorator
@@ -30,8 +29,7 @@ from accelerate import Accelerator
 
 # actor critic - PaLM with lora
 
-PPOActorCriticReturn = namedtuple('PPOActorCriticReturn', [
-    'state',
+PPOActionCriticReturn = namedtuple('PPOActionCriticReturn', [
     'actions',
     'sequence',
     'mask',
@@ -117,8 +115,8 @@ class ActorCritic(nn.Module):
     ):
         actions = self.actor_palm.generate(
             max_seq_len,
-            prompt = state,
-            eos_token = eos_token,
+            prompt = state,       
+            eos_token = eos_token,     
             finetune_scope = self.actor_lora_scope,
             use_tqdm = True,
             **kwargs
@@ -142,12 +140,10 @@ class ActorCritic(nn.Module):
         action_logits, value = self.forward(
             sequence,
             mask = action_mask,
-            return_values = return_values,
-            return_last_n_tokens = action_len
-        )
+            return_values = return_values
+        )        
 
-        return PPOActorCriticReturn(
-            state,
+        return PPOActionCriticReturn(
             actions,
             sequence,
             mask,
@@ -160,159 +156,10 @@ class ActorCritic(nn.Module):
         self,
         x,
         mask = None,
-        return_values = True,
-        return_last_n_tokens = None  # if not None, this would return only the last N of the sequence dimension (dimension 2)
-    ):
-        action_logits = self.actor_palm(
-            prompt = x,
-            finetune_scope = self.actor_lora_scope
-        )
-
-        if exists(return_last_n_tokens):
-            action_logits = action_logits[:, -return_last_n_tokens:]
-
-        if not return_values:
-            return action_logits, None
-
-        critic_embeds = self.critic_palm(
-            prompt = x,
-            return_only_embedding = True,
-            finetune_scope = self.critic_lora_scope
-        )
-
-        if self.pooled_values:
-            critic_embeds = masked_mean(critic_embeds, mask, dim = 1)
-
-        values = self.value_head(critic_embeds)
-
-        if not self.pooled_values and exists(return_last_n_tokens):
-            values = values[:, -return_last_n_tokens:]
-
-        return action_logits, values
-
-@beartype
-class ActorCriticEncDec(nn.Module):
-    def __init__(
-        self,
-        palm: PaLMEncDec,
-        critic_palm: Optional[PaLMEncDec] = None,
-        pooled_values = False,
-        actor_lora = True,
-        critic_lora = True,
-        actor_lora_r = 8,
-        critic_lora_r = 8,
-        actor_lora_scope = 'actor',
-        critic_lora_scope = 'critic',
-        actor_dropout = 0.,
-        critic_dropout = 0.
-    ):
-        super().__init__()
-        self.actor_palm = palm
-
-        self.critic_palm = critic_palm
-
-        if not exists(self.critic_palm):
-            self.critic_palm = copy.deepcopy(palm)
-
-        self.actor_palm.set_dropout(actor_dropout)
-        self.critic_palm.set_dropout(critic_dropout)
-
-        self.actor_lora = actor_lora
-        self.critic_lora = critic_lora
-
-        self.actor_lora_scope = actor_lora_scope if actor_lora else None
-        self.critic_lora_scope = critic_lora_scope if critic_lora else None
-
-        if self.actor_lora:
-            self.actor_palm.add_finetune_params(actor_lora_scope, lora_r = actor_lora_r)
-
-        if self.critic_lora:
-            self.critic_palm.add_finetune_params(critic_lora_scope, lora_r = critic_lora_r)
-
-        self.pooled_values = pooled_values
-        self.value_head = nn.Sequential(
-            nn.Linear(palm.dim, 1),
-            Rearrange('... 1 -> ...')
-        )
-
-        nn.init.zeros_(self.value_head[0].bias)
-        nn.init.orthogonal_(self.value_head[0].weight, gain = math.sqrt(2))
-
-    def actor_parameters(self):
-        if not self.actor_lora:
-            return self.actor_palm.parameters()
-
-        return [
-            *self.actor_palm.finetune_parameters(self.actor_lora_scope)
-        ]
-
-    def critic_parameters(self):
-        if not self.actor_lora:
-            return [*self.critic_palm.parameters(), *self.value_head.parameters()]
-
-        return [
-            *self.critic_palm.finetune_parameters(self.critic_lora_scope),
-            *self.value_head.parameters()
-        ]
-
-    @torch.no_grad()
-    @eval_decorator
-    def generate(
-        self,
-        state,
-        max_seq_len,
-        eos_token = None,
-        return_values = False,
-        **kwargs
-    ):
-        actions = self.actor_palm.generate(
-            max_seq_len,
-            prompt = state,
-            eos_token = eos_token,
-            finetune_scope = self.actor_lora_scope,
-            use_tqdm = True,
-            **kwargs
-        )
-
-        sequence = torch.cat((state, actions), dim = -1)
-        action_len = actions.shape[-1]
-        state_len = state.shape[-1]
-
-        prompt_mask = torch.arange(sequence.shape[-1], device = state.device) < state_len
-        prompt_mask = repeat(prompt_mask, 'n -> b n', b = sequence.shape[0])
-
-        mask = None
-        if exists(eos_token):
-            mask = ((sequence == eos_token).cumsum(dim = -1) == 0)
-            mask = F.pad(mask, (1, -1), value = True) # include eos token
-            action_mask &= mask
-
-        action_logits, value = self.forward(
-            actions,
-            prompt = state,
-            return_values = return_values
-        )
-
-        return PPOActorCriticReturn(
-            state,
-            actions,
-            sequence,
-            mask,
-            prompt_mask,
-            action_logits,
-            value
-        )
-
-    def forward(
-        self,
-        actions,
-        prompt,
-        mask = None,
         return_values = True
     ):
         action_logits = self.actor_palm(
-            prompt = prompt,
-            decoder_seq = actions,
+            x,
             finetune_scope = self.actor_lora_scope
         )
 
@@ -320,13 +167,13 @@ class ActorCriticEncDec(nn.Module):
             return action_logits, None
 
         critic_embeds = self.critic_palm(
-            prompt = prompt,
-            decoder_seq = actions,
+            x,
             return_only_embedding = True,
             finetune_scope = self.critic_lora_scope
         )
 
         if self.pooled_values:
+            critic_embeds = shift(critic_embeds, shift = 1, dim = -2)
             critic_embeds = masked_mean(critic_embeds, mask, dim = 1)
 
         values = self.value_head(critic_embeds)
@@ -336,8 +183,6 @@ class ActorCriticEncDec(nn.Module):
 # data
 
 Memory = namedtuple('Memory', [
-    'state',
-    'action',
     'sequence',
     'prompt_mask',
     'mask',
@@ -407,6 +252,10 @@ def log(t, eps = 1e-20):
 def log_prob(prob, indices):
     return log(prob.gather(-1, indices[..., None])).squeeze(-1)
 
+def shift(t, value = 0, shift = 1, dim = -1):
+    zeros = (0, 0) * (-dim - 1)
+    return F.pad(t, (*zeros, shift, -shift), value = value)
+
 def masked_entropy(prob, dim = -1, mask = None):
     entropies = (prob * log(prob)).sum(dim = -1)
     return masked_mean(entropies, mask = mask).mean()
@@ -439,9 +288,9 @@ class RLHFTrainer(nn.Module):
         prompts_path: Optional[str] = None,
         prompt_token_ids: Optional[torch.Tensor] = None,
         tokenizer: Callable = None,
-        palm: Union[PaLM, PaLMEncDec],
+        palm: PaLM,
         reward_model: RewardModel,
-        actor_critic: Optional[Union[ActorCritic, ActorCriticEncDec]] = None,
+        actor_critic: Optional[ActorCritic] = None,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
         actor_wd = 0.,
@@ -490,12 +339,9 @@ class RLHFTrainer(nn.Module):
         # models
 
         self.palm = palm
-        self.is_enc_dec = isinstance(palm, PaLMEncDec)
 
         if not exists(actor_critic):
-            actor_critic_klass = ActorCriticEncDec if self.is_enc_dec else ActorCritic
-
-            actor_critic = actor_critic_klass(
+            actor_critic = ActorCritic(
                 palm = palm,
                 actor_lora = actor_lora,
                 critic_lora = critic_lora,
@@ -507,8 +353,6 @@ class RLHFTrainer(nn.Module):
             ).to(palm.device)
 
         self.actor_critic = actor_critic
-
-        assert actor_critic.actor_palm == palm
 
         self.reward_model = reward_model.eval()
 
@@ -578,7 +422,6 @@ class RLHFTrainer(nn.Module):
         actor_critic.eval()
 
         (
-            states,
             actions,
             sequences,
             mask,
@@ -625,8 +468,6 @@ class RLHFTrainer(nn.Module):
 
         for _ in range(self.epochs):
             for (
-                states,
-                actions,
                 sequences,
                 prompt_masks,
                 masks,
@@ -636,39 +477,39 @@ class RLHFTrainer(nn.Module):
                 old_values
             ) in dl:
                 action_masks = ~prompt_masks & masks
+
+                action_logits, values = self.actor_critic(
+                    sequences,
+                    mask = action_masks
+                )
+
+                action_logits = shift(action_logits, shift = 1, dim = -2) # need to shift along sequence dimension by 1, since actions start from the last prompt (state) token
                 action_len = old_log_probs.shape[-1]
 
-                if self.is_enc_dec:
-                    action_logits, values = self.actor_critic(
-                        actions,
-                        prompt = states
-                    )
-                else:
-                    action_logits, values = self.actor_critic(
-                        sequences,
-                        mask = action_masks,
-                        return_last_n_tokens = action_len
-                    )
-
                 action_probs = action_logits.softmax(dim = -1)
-                action_log_probs = log_prob(action_probs, actions)
+                action_log_probs = log_prob(action_probs, sequences)
+                action_log_probs = action_log_probs[:, -action_len:]
 
                 # calculate entropies, taking into account which part of the sequence is actually an action
 
-                entropies = masked_entropy(action_probs, mask = action_masks[:, -action_len:])
+                entropies = masked_entropy(action_probs, mask = action_masks)
 
                 # calculate kl div between old action probs and new ones, taking into account which part of the sequence is action or not
 
                 kl_div_loss = 0.
 
                 if self.kl_div_loss_weight > 0:
-                    kl_div_loss = masked_kl_div(action_probs, old_action_probs, mask = action_masks[:, -action_len:]) * self.kl_div_loss_weight
+                    kl_div_loss = masked_kl_div(action_probs, old_action_probs, mask = action_masks) * self.kl_div_loss_weight
 
                 # handle non-pooled values
 
                 normalize_kwargs = dict()
 
                 if old_values.ndim == 2:
+                    old_values, values = map(lambda t: shift(t, shift = 1, dim = -2), (old_values, values))
+
+                    old_values = old_values[:, -action_len:]
+                    values = values[:, -action_len:]
                     rewards = rearrange(rewards, 'b -> b 1')
                     normalize_kwargs = dict(dim = -1, mask = action_masks[:, -action_len:])
 
@@ -753,7 +594,6 @@ class RLHFTrainer(nn.Module):
                 # get predicted sequence
 
                 (
-                    states,
                     actions,
                     sequence,
                     mask,
@@ -768,16 +608,21 @@ class RLHFTrainer(nn.Module):
                     return_values = True
                 )
 
+                action_logits = shift(action_logits, shift = 1, dim = -2) # need to shift along sequence dimension by 1, since actions start from the last prompt (state) token
+
                 action_prob = action_logits.softmax(dim = -1)
                 action_log_prob = log_prob(action_prob, actions)
 
+                actions = rearrange(actions, '1 ... -> ...')
+
                 # get reward as given by supervised trained reward model
 
-                sequence = torch.cat((states, actions), dim = -1)
+                sequence = torch.cat((state, actions), dim = 0)
 
                 prompt_length = len(state)
                 prompt_mask = torch.arange(sequence.shape[-1], device = device) < prompt_length
 
+                sequence = rearrange(sequence, 'n -> 1 n')
                 prompt_mask = rearrange(prompt_mask, 'n -> 1 n')
                 mask = rearrange(mask, 'n -> 1 n') if exists(mask) else torch.ones(sequence.shape, dtype = torch.bool, device = device)
 
@@ -793,8 +638,6 @@ class RLHFTrainer(nn.Module):
                 # store memory for learning
 
                 memories.append(Memory(*map(detach_to_cpu_, (
-                    states,
-                    actions,
                     sequence,
                     prompt_mask,
                     mask,
