@@ -17,7 +17,7 @@ from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 from palm_rlhf_pytorch.palm import PaLM
@@ -219,7 +219,9 @@ def exists(val):
     return val is not None
 
 def default(val, d):
-    return val if exists(val) else d
+    if exists(val):
+        return val
+    return d() if callable(d) else d
 
 def masked_normalize(t, eps = 1e-5, mask = None, dim = None):
     dim = default(dim, tuple(range(t.ndim)))
@@ -250,6 +252,7 @@ def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
 def log_prob(prob, indices):
+    assert prob.shape[:2] == indices.shape, f'preceding shapes of prob {prob.shape[:2]} and indices {indices.shape} must match'
     return log(prob.gather(-1, indices[..., None])).squeeze(-1)
 
 def shift(t, value = 0, shift = 1, dim = -1):
@@ -260,16 +263,17 @@ def masked_entropy(prob, dim = -1, mask = None):
     entropies = (prob * log(prob)).sum(dim = -1)
     return masked_mean(entropies, mask = mask).mean()
 
-def masked_kl_div(prob1, prob2, mask = None):
+def masked_kl_div(prob1, prob2, mask = None, reduce_batch = False):
     """
     need to account for variable sequence lengths, therefore not using the built-in functional version
     """
-    kl_divs = (prob1 * (log(prob2) - log(prob1))).sum(dim = -1)
+    kl_divs = (prob1 * (log(prob1) - log(prob2))).sum(dim = -1)
+    loss = masked_mean(kl_divs, mask)
 
-    if not exists(mask):
-        return kl_divs.mean()
+    if reduce_batch:
+        return loss.mean()
 
-    return masked_mean(kl_divs, mask).mean()
+    return loss
 
 def clipped_value_loss(values, rewards, old_values, clip):
     value_clipped = old_values + (values - old_values).clamp(-clip, clip)
@@ -290,6 +294,7 @@ class RLHFTrainer(nn.Module):
         tokenizer: Callable = None,
         palm: PaLM,
         reward_model: RewardModel,
+        critic_palm: Optional[PaLM] = None,
         actor_critic: Optional[ActorCritic] = None,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
@@ -313,7 +318,8 @@ class RLHFTrainer(nn.Module):
         minibatch_size = 16,
         epochs = 1,
         kl_div_loss_weight = 0.1, # between old action probs and new action probs - not sure what the right value is
-        accelerate_kwargs: dict = {}
+        accelerate_kwargs: dict = {},
+        use_lion = False
     ):
         super().__init__()
 
@@ -343,6 +349,7 @@ class RLHFTrainer(nn.Module):
         if not exists(actor_critic):
             actor_critic = ActorCritic(
                 palm = palm,
+                critic_palm = critic_palm,
                 actor_lora = actor_lora,
                 critic_lora = critic_lora,
                 actor_lora_r = actor_lora_r,
@@ -366,8 +373,8 @@ class RLHFTrainer(nn.Module):
 
         # optimizers
 
-        self.actor_optim = get_optimizer(actor_critic.actor_parameters(), lr = actor_lr, wd = actor_wd, betas = betas, eps = actor_adam_eps)
-        self.critic_optim = get_optimizer(actor_critic.critic_parameters(), lr = critic_lr, wd = critic_wd, betas = betas, eps = critic_adam_eps)
+        self.actor_optim = get_optimizer(actor_critic.actor_parameters(), lr = actor_lr, wd = actor_wd, betas = betas, eps = actor_adam_eps, use_lion = use_lion)
+        self.critic_optim = get_optimizer(actor_critic.critic_parameters(), lr = critic_lr, wd = critic_wd, betas = betas, eps = critic_adam_eps, use_lion = use_lion)
 
         # ppo hyperparams
 
@@ -496,10 +503,14 @@ class RLHFTrainer(nn.Module):
 
                 # calculate kl div between old action probs and new ones, taking into account which part of the sequence is action or not
 
-                kl_div_loss = 0.
+                kl_penalty = 0.
 
                 if self.kl_div_loss_weight > 0:
-                    kl_div_loss = masked_kl_div(action_probs, old_action_probs, mask = action_masks) * self.kl_div_loss_weight
+                    kl_penalty = masked_kl_div(old_action_probs, action_probs, mask = action_masks) * self.kl_div_loss_weight
+
+                # subtract the kl penalty from the rewards
+
+                rewards = rewards - kl_penalty
 
                 # handle non-pooled values
 
@@ -530,7 +541,7 @@ class RLHFTrainer(nn.Module):
 
                 # combine losses
 
-                loss = policy_loss.mean() + kl_div_loss
+                loss = policy_loss.mean()
 
                 # update actor
 
@@ -546,7 +557,7 @@ class RLHFTrainer(nn.Module):
 
                 # calculate value loss and update value network separate from policy network
 
-                value_loss = clipped_value_loss(values, rewards, old_values, self.value_clip)
+                value_loss = clipped_value_loss(values, rewards.detach(), old_values, self.value_clip)
                 value_loss = value_loss.mean()
 
                 self.print(f'critic_loss: {value_loss.item():.3f}')
@@ -607,11 +618,13 @@ class RLHFTrainer(nn.Module):
                     temperature = temperature,
                     return_values = True
                 )
-
                 action_logits = shift(action_logits, shift = 1, dim = -2) # need to shift along sequence dimension by 1, since actions start from the last prompt (state) token
 
                 action_prob = action_logits.softmax(dim = -1)
-                action_log_prob = log_prob(action_prob, actions)
+
+                action_len = actions.shape[-1]
+                action_log_prob = log_prob(action_prob, sequence)
+                action_log_prob = action_log_prob[:, -action_len:]
 
                 actions = rearrange(actions, '1 ... -> ...')
 
@@ -624,7 +637,7 @@ class RLHFTrainer(nn.Module):
 
                 sequence = rearrange(sequence, 'n -> 1 n')
                 prompt_mask = rearrange(prompt_mask, 'n -> 1 n')
-                mask = rearrange(mask, 'n -> 1 n') if exists(mask) else torch.ones(sequence.shape, dtype = torch.bool, device = device)
+                mask = default(mask, lambda: torch.ones(sequence.shape, dtype = torch.bool, device = device))
 
                 reward = self.reward_model(
                     sequence,

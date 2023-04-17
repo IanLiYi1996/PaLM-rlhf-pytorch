@@ -8,6 +8,8 @@ Implementation of RLHF (Reinforcement Learning with Human Feedback) on top of th
 
 If you are interested in replicating something like ChatGPT out in the open, please consider joining <a href="https://discord.gg/xBPBXfcFHd">Laion <img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a>
 
+Alternative: <a href="https://arxiv.org/abs/2302.02676">Chain of Hindsight</a>
+
 ## FAQ
 
 - Does this contain a model for inference?
@@ -28,6 +30,10 @@ There is no trained model. This is just the ship and overall map. We still need 
 
 - <a href="https://huggingface.co/">🤗 Hugging Face</a> and <a href="https://carper.ai/">CarperAI</a> for penning the blog post <a href="https://huggingface.co/blog/rlhf">Illustrating Reinforcement Learning from Human Feedback (RLHF)</a>, and the former also for their <a href="https://huggingface.co/docs/accelerate/index">accelerate</a> library
 
+- <a href="https://github.com/kisseternity">@kisseternity</a> and <a href="https://github.com/taynoel84">@taynoel84</a> for the code review and finding bugs
+
+- <a href="https://github.com/conceptofmind">Enrico</a> for integrating <a href="https://arxiv.org/abs/2205.14135">Flash Attention</a> from Pytorch 2.0
+
 ## Install
 
 ```bash
@@ -45,7 +51,8 @@ from palm_rlhf_pytorch import PaLM
 palm = PaLM(
     num_tokens = 20000,
     dim = 512,
-    depth = 12
+    depth = 12,
+    flash_attn = True # https://arxiv.org/abs/2205.14135
 ).cuda()
 
 seq = torch.randint(0, 20000, (1, 2048)).cuda()
@@ -142,6 +149,7 @@ answer = trainer.generate(2048, prompt = prompts[0], num_samples = 10) # (<= 204
 - [x] clone base transformer with separate lora for critic
 - [x] also allow for non-LoRA based finetuning
 - [x] redo normalize to be able to have a masked version, not sure if anyone will ever use per token rewards / values, but good practice to implement
+- [x] equip with <a href="https://github.com/hazyResearch/flash-attention">the best attention</a>
 
 - [ ] add Hugging Face accelerate and test out wandb instrumentation
 - [ ] search literature to figure out what is the latest SOTA for PPO, assuming RL field is still making progress.
@@ -152,7 +160,6 @@ answer = trainer.generate(2048, prompt = prompts[0], num_samples = 10) # (<= 204
 - [ ] incorporate some learning points from Sparrow, given Letitia's video
 - [ ] simple web interface with django + htmx for collecting human feedback
 - [ ] consider extending with <a href="https://arxiv.org/abs/2212.08153">FIDO</a>
-- [ ] equip with <a href="https://github.com/hazyResearch/flash-attention">the best attention</a>
 - [ ] consider <a href="https://www.anthropic.com/constitutional.pdf">RLAIF</a>
 
 ## Citations
@@ -199,5 +206,14 @@ answer = trainer.generate(2048, prompt = prompts[0], num_samples = 10) # (<= 204
     author = {Justin Gilmer, Andrea Schioppa, and Jeremy Cohen},
     year   = {2023},
     status = {to be published - one attention stabilization technique is circulating within Google Brain, being used by multiple teams}
+}
+```
+
+```bibtex
+@inproceedings{dao2022flashattention,
+    title   = {Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+    author  = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2022}
 }
 ```

@@ -2,6 +2,7 @@ import math
 import copy
 from pathlib import Path
 from collections import namedtuple
+from functools import wraps
 from itertools import zip_longest
 
 from tqdm import tqdm
@@ -15,6 +16,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
+from palm_rlhf_pytorch.attention import Attention
 from palm_rlhf_pytorch.utils import top_p, top_k, masked_mean, gumbel_sample, eval_decorator
 from palm_rlhf_pytorch.lora import LoRA
 
@@ -121,13 +123,14 @@ class ParallelTransformerBlock(nn.Module):
         dim_head = 64,
         causal = True,
         heads = 8,
-        qk_rmsnorm = True,
+        qk_rmsnorm = False,
         qk_scale = 8,
         ff_mult = 4,
         attn_dropout = 0.,
         ff_dropout = 0.,
         use_xpos = True,
-        xpos_scale_base = 512
+        xpos_scale_base = 512,
+        flash_attn = False,
     ):
         super().__init__()
         self.norm = LayerNorm(dim)
@@ -142,6 +145,12 @@ class ParallelTransformerBlock(nn.Module):
             self.q_scale = nn.Parameter(torch.ones(dim_head))
             self.k_scale = nn.Parameter(torch.ones(dim_head))
 
+        self.attend = Attention(
+            causal = causal,
+            dropout = attn_dropout,
+            use_flash_attn = flash_attn
+        )
+
         self.heads = heads
         self.scale = (dim_head ** -0.5) if not qk_rmsnorm else qk_scale
         self.causal = causal
@@ -150,8 +159,10 @@ class ParallelTransformerBlock(nn.Module):
 
         self.fused_attn_ff_proj = nn.Linear(dim, sum(self.fused_dims), bias=False)
 
+        self.flash_attn = flash_attn
         self.attn_out = nn.Linear(attn_inner_dim, dim, bias=False)
         self.attn_dropout = nn.Dropout(attn_dropout)
+        self.flash_attn_dropout = attn_dropout
 
         # parallel feedforward tail
 
@@ -163,17 +174,8 @@ class ParallelTransformerBlock(nn.Module):
 
         # for caching causal mask and rotary embeddings
 
-        self.register_buffer("mask", None, persistent=False)
         self.register_buffer("pos_emb", None, persistent=False)
         self.register_buffer("pos_emb_scale", None, persistent=False)
-
-    def get_mask(self, n, device):
-        if exists(self.mask) and self.mask.shape[-1] >= n:
-            return self.mask[:n, :n]
-
-        mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
-        self.register_buffer("mask", mask, persistent=False)
-        return mask
 
     def get_rotary_embedding(self, n, device):
         if exists(self.pos_emb) and self.pos_emb.shape[-2] >= n:
@@ -239,30 +241,9 @@ class ParallelTransformerBlock(nn.Module):
         q = apply_rotary_pos_emb(positions, q, scale)
         k = apply_rotary_pos_emb(positions, k, scale ** -1)
 
-        # similarity
+        # attention function, either regular or flash
 
-        sim = einsum("b h i d, b j d -> b h i j", q, k) * self.scale
-
-        # key padding mask
-
-        if exists(mask):
-            mask = rearrange(mask, 'b j -> b 1 1 j')
-            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
-
-        # causal mask
-
-        if self.causal:
-            causal_mask = self.get_mask(n, device)
-            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-
-        # attention
-
-        attn = sim.softmax(dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # aggregate values
-
-        out = einsum("b h i j, b j d -> b h i d", attn, v)
+        out = self.attend(q, k, v, mask = mask)
 
         # merge heads
 
@@ -352,9 +333,10 @@ class PaLM(nn.Module):
         ff_mult = 4,
         attn_dropout = 0.,
         ff_dropout = 0.,
-        qk_rmsnorm = True,
+        qk_rmsnorm = False,
         lora_r = 8,
         rotary_xpos_scale_base = 512,
+        flash_attn = False,
         finetune_scopes = tuple(),
         cross_entropy_ignore_index = 0,
         cross_attend = False,
@@ -386,7 +368,8 @@ class PaLM(nn.Module):
                 ff_mult = ff_mult,
                 attn_dropout = attn_dropout,
                 ff_dropout = ff_dropout,
-                xpos_scale_base = rotary_xpos_scale_base
+                xpos_scale_base = rotary_xpos_scale_base,
+                flash_attn = flash_attn
             ))
 
             cross_attn = None
